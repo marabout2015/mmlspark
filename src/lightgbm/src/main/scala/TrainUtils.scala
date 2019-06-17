@@ -6,81 +6,99 @@ package com.microsoft.ml.spark
 import java.io._
 import java.net._
 
-import com.microsoft.ml.lightgbm.{SWIGTYPE_p_float, SWIGTYPE_p_void, lightgbmlib, lightgbmlibConstants}
+import com.microsoft.ml.lightgbm._
 import com.microsoft.ml.spark.StreamUtilities.using
 import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.ml.attribute._
 import org.apache.spark.ml.linalg.{DenseVector, SparseVector}
-import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.Row
 import org.slf4j.Logger
 
 case class NetworkParams(defaultListenPort: Int, addr: String, port: Int)
 
 private object TrainUtils extends Serializable {
 
-  private def addField(field: Array[Double], fieldName: String, numRows: Int, datasetPtr: Option[SWIGTYPE_p_void]) = {
-    // Generate the column and add to dataset
-    var colArray: Option[SWIGTYPE_p_float] = None
-    try {
-      colArray = Some(lightgbmlib.new_floatArray(numRows))
-      field.zipWithIndex.foreach(ri =>
-        lightgbmlib.floatArray_setitem(colArray.get, ri._2, ri._1.toFloat))
-      val colAsVoidPtr = lightgbmlib.float_to_voidp_ptr(colArray.get)
-      val data32bitType = lightgbmlibConstants.C_API_DTYPE_FLOAT32
-      LightGBMUtils.validate(
-        lightgbmlib.LGBM_DatasetSetField(datasetPtr.get, fieldName, colAsVoidPtr, numRows, data32bitType),
-        "DatasetSetField")
-    } finally {
-      // Free column
-      colArray.foreach(lightgbmlib.delete_floatArray(_))
-    }
-  }
-
   def generateDataset(rows: Array[Row], labelColumn: String, featuresColumn: String,
-                      weightColumn: Option[String],
-                      referenceDataset: Option[SWIGTYPE_p_void]): Option[SWIGTYPE_p_void] = {
+                      weightColumn: Option[String], initScoreColumn: Option[String], groupColumn: Option[String],
+                      referenceDataset: Option[LightGBMDataset]): Option[LightGBMDataset] = {
     val numRows = rows.length
     val labels = rows.map(row => row.getDouble(row.fieldIndex(labelColumn)))
     val hrow = rows.head
-    var datasetPtr: Option[SWIGTYPE_p_void] = None
+    var datasetPtr: Option[LightGBMDataset] = None
     datasetPtr =
       if (hrow.get(hrow.fieldIndex(featuresColumn)).isInstanceOf[DenseVector]) {
         val rowsAsDoubleArray = rows.map(row => row.get(row.fieldIndex(featuresColumn)) match {
           case dense: DenseVector => dense.toArray
           case sparse: SparseVector => sparse.toDense.toArray
         })
-        Some(LightGBMUtils.generateDenseDataset(numRows, rowsAsDoubleArray, referenceDataset))
+        val slotNames = getSlotNames(rows(0).schema, featuresColumn, rowsAsDoubleArray.head.length)
+        Some(LightGBMUtils.generateDenseDataset(numRows, rowsAsDoubleArray, referenceDataset, slotNames))
       } else {
         val rowsAsSparse = rows.map(row => row.get(row.fieldIndex(featuresColumn)) match {
           case dense: DenseVector => dense.toSparse
           case sparse: SparseVector => sparse
         })
-        Some(LightGBMUtils.generateSparseDataset(rowsAsSparse, referenceDataset))
+        val slotNames = getSlotNames(rows(0).schema, featuresColumn, rowsAsSparse(0).size)
+        Some(LightGBMUtils.generateSparseDataset(rowsAsSparse, referenceDataset, slotNames))
       }
 
     // Validate generated dataset has the correct number of rows and cols
-    validateDataset(datasetPtr.get)
-    addField(labels, "label", numRows, datasetPtr)
+    datasetPtr.get.validateDataset()
+    datasetPtr.get.addFloatField(labels, "label", numRows)
     weightColumn.foreach { col =>
       val weights = rows.map(row => row.getDouble(row.fieldIndex(col)))
-      addField(weights, "weight", numRows, datasetPtr)
+      datasetPtr.get.addFloatField(weights, "weight", numRows)
+    }
+    addGroupColumn(rows, groupColumn, datasetPtr, numRows)
+    initScoreColumn.foreach { col =>
+      val initScores = rows.map(row => row.getDouble(row.fieldIndex(col)))
+      datasetPtr.get.addDoubleField(initScores, "init_score", numRows)
     }
     datasetPtr
   }
 
-  def createBooster(trainParams: TrainParams, trainDatasetPtr: Option[SWIGTYPE_p_void],
-                    validDatasetPtr: Option[SWIGTYPE_p_void]): Option[SWIGTYPE_p_void] = {
+  def addGroupColumn(rows: Array[Row], groupColumn: Option[String],
+                     datasetPtr: Option[LightGBMDataset], numRows: Int): Unit = {
+    groupColumn.foreach { col =>
+      val group = rows.map(row => row.getInt(row.fieldIndex(col)))
+      // Convert to distinct count (note ranker should have sorted within partition by group id)
+      // We use a triplet of a list of cardinalities, last unqiue value and unique value count
+      val cardinalityTriplet =
+      group.foldLeft((List.empty[Int], -1, 0)) { (listValue, currentValue) =>
+        if (listValue._2 < 0) {
+          // Base case, keep list as empty and set cardinality to 1
+          (listValue._1, currentValue, 1)
+        }
+        else if (listValue._2 == currentValue) {
+          // Encountered same value
+          (listValue._1, currentValue, listValue._3 + 1)
+        }
+        else {
+          // New value, need to reset counter and add new cardinality to list
+          (listValue._3 :: listValue._1, currentValue, 1)
+        }
+      }
+      val groupCardinality = (cardinalityTriplet._3 :: cardinalityTriplet._1).reverse.toArray
+      datasetPtr.get.addIntField(groupCardinality, "group", groupCardinality.length)
+    }
+  }
+
+  def createBooster(trainParams: TrainParams, trainDatasetPtr: Option[LightGBMDataset],
+                    validDatasetPtr: Option[LightGBMDataset]): Option[SWIGTYPE_p_void] = {
     // Create the booster
     val boosterOutPtr = lightgbmlib.voidpp_handle()
     val parameters = trainParams.toString()
-    LightGBMUtils.validate(lightgbmlib.LGBM_BoosterCreate(trainDatasetPtr.get, parameters, boosterOutPtr), "Booster")
+    LightGBMUtils.validate(lightgbmlib.LGBM_BoosterCreate(trainDatasetPtr.map(_.dataset).get,
+                                                          parameters, boosterOutPtr), "Booster")
     val boosterPtr = Some(lightgbmlib.voidpp_value(boosterOutPtr))
     trainParams.modelString.foreach { modelStr =>
       val booster = LightGBMUtils.getBoosterPtrFromModelString(modelStr)
       LightGBMUtils.validate(lightgbmlib.LGBM_BoosterMerge(boosterPtr.get, booster), "Booster Merge")
     }
-    validDatasetPtr.foreach { dataset =>
+    validDatasetPtr.foreach { lgbmdataset =>
       LightGBMUtils.validate(lightgbmlib.LGBM_BoosterAddValidData(boosterPtr.get,
-        dataset), "Add Validation Dataset")
+        lgbmdataset.dataset), "Add Validation Dataset")
     }
     boosterPtr
   }
@@ -158,17 +176,35 @@ private object TrainUtils extends Serializable {
     }
   }
 
+  def getSlotNames(schema: StructType, featuresColumn: String, numCols: Int): Option[Array[String]] = {
+    val featuresSchema = schema.fields(schema.fieldIndex(featuresColumn))
+    val metadata = AttributeGroup.fromStructField(featuresSchema)
+    if (metadata.attributes.isEmpty) None
+    else if (metadata.attributes.get.isEmpty) None
+    else {
+      val colnames = (0 until numCols).map(_.toString).toArray
+      metadata.attributes.get.foreach {
+        case attr =>
+          attr.index.foreach(index => colnames(index) = attr.name.getOrElse(index.toString))
+      }
+      Some(colnames)
+    }
+  }
+
   def translate(labelColumn: String, featuresColumn: String, weightColumn: Option[String],
-                validationData: Option[Broadcast[Array[Row]]], log: Logger,
-                trainParams: TrainParams, inputRows: Iterator[Row]): Iterator[LightGBMBooster] = {
+                initScoreColumn: Option[String], groupColumn: Option[String],
+                validationData: Option[Broadcast[Array[Row]]],
+                log: Logger, trainParams: TrainParams,
+                inputRows: Iterator[Row]): Iterator[LightGBMBooster] = {
     val rows = inputRows.toArray
-    var trainDatasetPtr: Option[SWIGTYPE_p_void] = None
-    var validDatasetPtr: Option[SWIGTYPE_p_void] = None
+    var trainDatasetPtr: Option[LightGBMDataset] = None
+    var validDatasetPtr: Option[LightGBMDataset] = None
     try {
-      trainDatasetPtr = generateDataset(rows, labelColumn, featuresColumn, weightColumn, None)
+      trainDatasetPtr = generateDataset(rows, labelColumn, featuresColumn,
+        weightColumn, initScoreColumn, groupColumn, None)
       if (validationData.isDefined) {
         validDatasetPtr = generateDataset(validationData.get.value, labelColumn,
-          featuresColumn, weightColumn, trainDatasetPtr)
+          featuresColumn, weightColumn, initScoreColumn, groupColumn, trainDatasetPtr)
       }
       var boosterPtr: Option[SWIGTYPE_p_void] = None
       try {
@@ -184,30 +220,8 @@ private object TrainUtils extends Serializable {
       }
     } finally {
       // Free datasets
-      trainDatasetPtr.foreach(dataset =>
-        LightGBMUtils.validate(lightgbmlib.LGBM_DatasetFree(dataset), "Finalize Train Dataset"))
-      validDatasetPtr.foreach(dataset =>
-        LightGBMUtils.validate(lightgbmlib.LGBM_DatasetFree(dataset), "Finalize Validation Dataset"))
-    }
-  }
-
-  private def validateDataset(datasetPtr: SWIGTYPE_p_void): Unit = {
-    // Validate num rows
-    val numDataPtr = lightgbmlib.new_intp()
-    LightGBMUtils.validate(lightgbmlib.LGBM_DatasetGetNumData(datasetPtr, numDataPtr), "DatasetGetNumData")
-    val numData = lightgbmlib.intp_value(numDataPtr)
-    if (numData <= 0) {
-      throw new Exception("Unexpected num data: " + numData)
-    }
-
-    // Validate num cols
-    val numFeaturePtr = lightgbmlib.new_intp()
-    LightGBMUtils.validate(
-      lightgbmlib.LGBM_DatasetGetNumFeature(datasetPtr, numFeaturePtr),
-      "DatasetGetNumFeature")
-    val numFeature = lightgbmlib.intp_value(numFeaturePtr)
-    if (numFeature <= 0) {
-      throw new Exception("Unexpected num feature: " + numFeature)
+      trainDatasetPtr.foreach(_.close())
+      validDatasetPtr.foreach(_.close())
     }
   }
 
@@ -274,12 +288,14 @@ private object TrainUtils extends Serializable {
       LightGBMUtils.validate(lightgbmlib.LGBM_NetworkInit(nodes, localListenPort,
         LightGBMConstants.defaultListenTimeout, nodes.split(",").length), "Network init")
     } catch {
-      case ex: Throwable => {
-        log.info(s"NetworkInit failed with exception on local port $localListenPort, retrying: $ex")
+      case ex @ (_: Exception | _: Throwable) => {
+        log.info(s"NetworkInit failed with exception on local port $localListenPort with exception: $ex")
         Thread.sleep(delay)
         if (retry > 0) {
+          log.info(s"Retrying NetworkInit with local port $localListenPort")
           networkInit(nodes, localListenPort, log, retry - 1, delay * 2)
         } else {
+          log.info(s"NetworkInit reached maximum exceptions on retry: $ex")
           throw ex
         }
       }
@@ -287,7 +303,8 @@ private object TrainUtils extends Serializable {
   }
 
   def trainLightGBM(networkParams: NetworkParams, labelColumn: String, featuresColumn: String,
-                    weightColumn: Option[String], validationData: Option[Broadcast[Array[Row]]], log: Logger,
+                    weightColumn: Option[String], initScoreColumn: Option[String], groupColumn: Option[String],
+                    validationData: Option[Broadcast[Array[Row]]], log: Logger,
                     trainParams: TrainParams, numCoresPerExec: Int)
                    (inputRows: Iterator[Row]): Iterator[LightGBMBooster] = {
     val emptyPartition = !inputRows.hasNext
@@ -313,7 +330,8 @@ private object TrainUtils extends Serializable {
         val retries = 3
         val initialDelay = 1000L
         networkInit(nodes, localListenPort, log, retries, initialDelay)
-        translate(labelColumn, featuresColumn, weightColumn, validationData, log, trainParams, inputRows)
+        translate(labelColumn, featuresColumn, weightColumn, initScoreColumn, groupColumn, validationData,
+          log, trainParams, inputRows)
       } finally {
         // Finalize network when done
         LightGBMUtils.validate(lightgbmlib.LGBM_NetworkFree(), "Finalize network")

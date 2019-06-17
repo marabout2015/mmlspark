@@ -42,7 +42,8 @@ class VerifyLightGBMClassifier extends Benchmarks with EstimatorFuzzing[LightGBM
   verifySaveBooster(
     fileName = "PimaIndian.csv",
     labelColumnName = "Diabetes mellitus",
-    outputFileName = "model.txt")
+    outputFileName = "model.txt",
+    colsToVerify = Array("Diabetes pedigree function", "Age (years)"))
 
   test("Compare benchmark results file to generated file", TestBase.Extended) {
     verifyBenchmarks()
@@ -90,7 +91,7 @@ class VerifyLightGBMClassifier extends Benchmarks with EstimatorFuzzing[LightGBM
     assert(modelStr.contains("[lambda_l2: 0.1]") || modelStr.contains("[lambda_l2: 0.5]"))
   }
 
-  test("Verify LightGBM Classifier with batch training") {
+  ignore("Verify LightGBM Classifier with batch training") {
     // Increment port index
     portIndex += numPartitions
     val fileName = "PimaIndian.csv"
@@ -115,6 +116,46 @@ class VerifyLightGBMClassifier extends Benchmarks with EstimatorFuzzing[LightGBM
       model.transform(featurizer.transform(dataset))
       assert(model != null)
     }
+  }
+
+  test("Verify LightGBM Classifier continued training with initial score") {
+    // Increment port index
+    portIndex += numPartitions
+    val fileName = "PimaIndian.csv"
+    val labelColumnName = "Diabetes mellitus"
+    val fileLocation = DatasetUtils.binaryTrainFile(fileName).toString
+    val dataset = readCSV(fileName, fileLocation).repartition(numPartitions)
+    val featuresColumn = "_features"
+    val rawPredCol = "rawPrediction"
+    val initScoreCol = "initScore"
+    val predictionCol = "prediction"
+    val probabilityCol = "probability"
+    val lgbm = new LightGBMClassifier()
+      .setLabelCol(labelColumnName)
+      .setFeaturesCol(featuresColumn)
+      .setRawPredictionCol(rawPredCol)
+      .setDefaultListenPort(LightGBMConstants.defaultLocalListenPort + portIndex)
+      .setNumLeaves(5)
+      .setNumIterations(30)
+      .setObjective(binaryObjective)
+
+    val featurizer = LightGBMUtils.featurizeData(dataset, labelColumnName, featuresColumn)
+    val trainingData = featurizer.transform(dataset)
+    val model = lgbm.fit(trainingData)
+    val scoredDataWithoutInitScore = model.transform(trainingData)
+    import org.apache.spark.sql.functions.udf
+    val convertUDF = udf((vector: org.apache.spark.ml.linalg.DenseVector) => vector(1))
+    val modelFromInitScore = lgbm.setInitScoreCol(initScoreCol).fit(scoredDataWithoutInitScore
+      .withColumn(initScoreCol, convertUDF(scoredDataWithoutInitScore(rawPredCol)))
+      .drop(predictionCol, probabilityCol, rawPredCol))
+    val scoredDataWithInitScore = modelFromInitScore.transform(trainingData)
+    val eval = new BinaryClassificationEvaluator()
+      .setLabelCol(labelColumnName)
+      .setRawPredictionCol(rawPredCol)
+    val metricWithoutInitScore = eval.evaluate(scoredDataWithoutInitScore)
+    val metricWithInitScore = eval.evaluate(scoredDataWithInitScore)
+    // Verify InitScore parameter improves metric
+    assert(metricWithoutInitScore < metricWithInitScore)
   }
 
   test("Verify LightGBM Classifier with weight column") {
@@ -436,8 +477,9 @@ class VerifyLightGBMClassifier extends Benchmarks with EstimatorFuzzing[LightGBM
   }
 
   def verifySaveBooster(fileName: String,
-                       outputFileName: String,
-                       labelColumnName: String): Unit = {
+                        outputFileName: String,
+                        labelColumnName: String,
+                        colsToVerify: Array[String]): Unit = {
     test("Verify LightGBMClassifier save booster to " + fileName) {
       // Increment port index
       portIndex += numPartitions
@@ -464,6 +506,8 @@ class VerifyLightGBMClassifier extends Benchmarks with EstimatorFuzzing[LightGBM
       assert(Files.exists(Paths.get(modelPath)), true)
 
       val oldModelString = model.getModel.model
+      // Verify model string contains some feature
+      colsToVerify.foreach(col => oldModelString.contains(col))
       val newModel = lgbm.setLabelCol(labelColumnName)
         .setFeaturesCol(featuresColumn)
         .setRawPredictionCol(rawPredCol)
