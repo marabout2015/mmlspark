@@ -58,11 +58,15 @@ class LightGBMRegressor(override val uid: String)
     RegressorTrainParams(getParallelism, getNumIterations, getLearningRate, getNumLeaves,
       getObjective, getAlpha, getTweedieVariancePower, getMaxBin, getBaggingFraction, getBaggingFreq, getBaggingSeed,
       getEarlyStoppingRound, getFeatureFraction, getMaxDepth, getMinSumHessianInLeaf, numWorkers, modelStr,
-      getVerbosity, categoricalIndexes, getBoostFromAverage, getBoostingType)
+      getVerbosity, categoricalIndexes, getBoostFromAverage, getBoostingType, getLambdaL1, getLambdaL2)
   }
 
   def getModel(trainParams: TrainParams, lightGBMBooster: LightGBMBooster): LightGBMRegressionModel = {
     new LightGBMRegressionModel(uid, lightGBMBooster, getLabelCol, getFeaturesCol, getPredictionCol)
+  }
+
+  def stringFromTrainedModel(model: LightGBMRegressionModel): String = {
+    model.getModel.model
   }
 
   override def copy(extra: ParamMap): LightGBMRegressor = defaultCopy(extra)

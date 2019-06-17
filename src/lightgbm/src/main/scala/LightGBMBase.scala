@@ -4,12 +4,14 @@
 package com.microsoft.ml.spark
 
 import org.apache.spark.ml.{Estimator, Model}
-import org.apache.spark.sql.{Dataset, Encoders}
+import org.apache.spark.sql.{DataFrame, Dataset, Encoders}
 
 import scala.concurrent.Await
 import scala.concurrent.duration.{Duration, SECONDS}
 import scala.math.min
-import org.apache.spark.ml.param.shared.{HasLabelCol => HasLabelColSpark, HasFeaturesCol => HasFeaturesColSpark}
+import org.apache.spark.ml.param.shared.{HasFeaturesCol => HasFeaturesColSpark, HasLabelCol => HasLabelColSpark}
+
+import scala.language.existentials
 
 trait LightGBMBase[TrainedModel <: Model[TrainedModel]] extends Estimator[TrainedModel]
   with LightGBMParams with HasFeaturesColSpark with HasLabelColSpark {
@@ -20,6 +22,21 @@ trait LightGBMBase[TrainedModel <: Model[TrainedModel]] extends Estimator[Traine
     * @return The trained model.
     */
   protected def train(dataset: Dataset[_]): TrainedModel = {
+    if (getNumBatches > 0) {
+      val ratio = 1.0 / getNumBatches
+      val datasets = dataset.randomSplit((0 until getNumBatches).map(_=> ratio).toArray)
+      datasets.foldLeft(None: Option[TrainedModel]) { (model, dataset) =>
+        if (!model.isEmpty) {
+          setModelString(stringFromTrainedModel(model.get))
+        }
+        Some(innerTrain(dataset))
+      }.get
+    } else {
+      innerTrain(dataset)
+    }
+  }
+
+  protected def innerTrain(dataset: Dataset[_]): TrainedModel = {
     val sc = dataset.sparkSession.sparkContext
     val numCoresPerExec = LightGBMUtils.getNumCoresPerExecutor(dataset)
     val numExecutorCores = LightGBMUtils.getNumExecutorCores(dataset, numCoresPerExec)
@@ -45,16 +62,35 @@ trait LightGBMBase[TrainedModel <: Model[TrainedModel]] extends Estimator[Traine
       if (get(validationIndicatorCol).isDefined && dataset.columns.contains(getValidationIndicatorCol))
         Some(sc.broadcast(df.filter(x => x.getBoolean(x.fieldIndex(getValidationIndicatorCol))).collect()))
       else None
-    val lightGBMBooster = df
+    val lightGBMBooster = preprocessData(df)
       .mapPartitions(TrainUtils.trainLightGBM(networkParams, getLabelCol, getFeaturesCol, get(weightCol),
-        validationData, log, trainParams, numCoresPerExec))(encoder)
+        get(initScoreCol), getOptGroupCol, validationData, log, trainParams, numCoresPerExec))(encoder)
       .reduce((booster1, _) => booster1)
     // Wait for future to complete (should be done by now)
     Await.result(future, Duration(getTimeout, SECONDS))
     getModel(trainParams, lightGBMBooster)
   }
 
+  /** Optional group column for Ranking, set to None by default.
+    * @return None
+    */
+  protected def getOptGroupCol: Option[String] = None
+
+  /** Gets the trained model given the train parameters and booster.
+    * @return trained model.
+    */
   protected def getModel(trainParams: TrainParams, lightGBMBooster: LightGBMBooster): TrainedModel
 
+  /** Gets the training parameters.
+    * @return train parameters.
+    */
   protected def getTrainParams(numWorkers: Int, categoricalIndexes: Array[Int], dataset: Dataset[_]): TrainParams
+
+  protected def stringFromTrainedModel(model: TrainedModel): String
+
+  /** Allow algorithm specific preprocessing of dataset.
+    * @param dataset The dataset to preprocess prior to training.
+    * @return The preprocessed data.
+    */
+  protected def preprocessData(dataset: DataFrame): DataFrame = dataset
 }

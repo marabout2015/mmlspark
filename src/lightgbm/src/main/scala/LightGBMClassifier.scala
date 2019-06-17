@@ -13,7 +13,7 @@ import scala.reflect.runtime.universe.{TypeTag, typeTag}
 
 object LightGBMClassifier extends DefaultParamsReadable[LightGBMClassifier]
 
-/** Trains a LightGBM Binary Classification model, a fast, distributed, high performance gradient boosting
+/** Trains a LightGBM Classification model, a fast, distributed, high performance gradient boosting
   * framework based on decision tree algorithms.
   * For more information please see here: https://github.com/Microsoft/LightGBM.
   * For parameter information see here: https://github.com/Microsoft/LightGBM/blob/master/docs/Parameters.rst
@@ -47,7 +47,8 @@ class LightGBMClassifier(override val uid: String)
     ClassifierTrainParams(getParallelism, getNumIterations, getLearningRate, getNumLeaves,
       getMaxBin, getBaggingFraction, getBaggingFreq, getBaggingSeed, getEarlyStoppingRound,
       getFeatureFraction, getMaxDepth, getMinSumHessianInLeaf, numWorkers, getObjective, modelStr,
-      getIsUnbalance, getVerbosity, categoricalIndexes, actualNumClasses, metric, getBoostFromAverage, getBoostingType)
+      getIsUnbalance, getVerbosity, categoricalIndexes, actualNumClasses, metric, getBoostFromAverage,
+      getBoostingType, getLambdaL1, getLambdaL2)
   }
 
   def getModel(trainParams: TrainParams, lightGBMBooster: LightGBMBooster): LightGBMClassificationModel = {
@@ -55,6 +56,10 @@ class LightGBMClassifier(override val uid: String)
     new LightGBMClassificationModel(uid, lightGBMBooster, getLabelCol, getFeaturesCol,
       getPredictionCol, getProbabilityCol, getRawPredictionCol,
       if (isDefined(thresholds)) Some(getThresholds) else None, classifierTrainParams.numClass)
+  }
+
+  def stringFromTrainedModel(model: LightGBMClassificationModel): String = {
+    model.getModel.model
   }
 
   override def copy(extra: ParamMap): LightGBMClassifier = defaultCopy(extra)
